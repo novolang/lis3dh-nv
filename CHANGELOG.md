@@ -31,7 +31,10 @@ I2C or an SPI bus.
   rounded (1.25 kHz, 5 kHz, 1.6 kHz), and the driver reports 1344, 5376
   and 1620 Hz from Zephyr's table.  Its self-test gives typical values and
   no limits.  A later revision should be read against both.
-- The device program builds for the nRF52840 DK and the nRF54LM20 DK, whose
-  board packages answer for I2C and SPI as absent hardware: on those
-  images `begin` answers `false` until the boards drive the buses.  The gap is tracked by
-  `features/embedded-devex/nordic-twim-i2c-driver.md`.
+- The device program builds for the nRF52840 DK and the nRF54LM20 DK.  Their
+  board packages answered for I2C and SPI as absent hardware when the
+  package was written (images of 13,088 and 13,932 bytes of flash, without
+  the reading path); the TWIM and SPIM drivers, tracked by
+  `features/embedded-devex/nordic-twim-i2c-driver.md`, landed on 2026-11-10,
+  and the images are now 19,728 and 20,684 bytes with the reading path.  A
+  reply from a LIS3DH over those buses is NOT VERIFIED until the driver rig.
