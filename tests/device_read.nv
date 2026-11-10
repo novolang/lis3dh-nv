@@ -1,0 +1,47 @@
+// device_read — a reading loop for a LIS3DH on a breakout, for an nRF52840 DK or
+// an nRF54LM20 DK.
+//
+// The breakout's SDA and SCL go to the board's I2C pins and its SDO/SA0
+// pin to ground, which puts the part at 0x18; INT1 goes to a free GPIO,
+// if the program is to read the data-ready line.  The program waits the
+// 5 ms the part takes to boot, brings it up at ±2 g in high resolution
+// at 100 Hz, and prints one line per sample over RTT:
+//
+//     lis3dh x=<milli-g> y=<milli-g> z=<milli-g>
+//
+// With the board flat and face up, z is close to 1000.
+//
+// Build it with `novo build --target=nrf52840-dk tests/device_read.nv` or
+// `novo build --target=nrf54lm20-dk tests/device_read.nv`.
+
+use embedded_hal.{ BoardI2c, BoardGpio }
+use dev_bus
+use dev_accel.{ AccelMilliG, Accelerometer }
+use lis3dh
+use lis3dh.{ Lis3dh }
+
+// The part's address with SA0 low.
+const ADDR = 0x18
+
+// A label and a number, written without building a string.
+fn field(label: Str, v: Int) [hw]
+    hal.uart.write(label)
+    hal.uart.write(str.from_int(v))
+
+@tier(embedded)
+fn main() [hw]
+    let part = Lis3dh.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, ADDR))
+    hal.timer.delay_ms(5)
+    if not part.begin()
+        hal.uart.write("lis3dh: no answer\n")
+        return
+    loop
+        match part.accel_read_new()
+            Some(a) =>
+                hal.uart.write("lis3dh")
+                field(" x=", a.x)
+                field(" y=", a.y)
+                field(" z=", a.z)
+                hal.uart.write("\n")
+            None =>
+                hal.timer.delay_ms(2)

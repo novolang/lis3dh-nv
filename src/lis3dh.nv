@@ -1,0 +1,791 @@
+// lis3dh — ST's LIS3DH three-axis accelerometer, on its I2C or its SPI
+// bus, as devices-nv's `Accelerometer` and `Identifiable`.
+//
+// The facts below are from ST's data sheet "LIS3DH: MEMS digital output
+// motion sensor, ultra low-power high performance 3-axes nano
+// accelerometer", Doc ID 17530 Rev 1, May 2010 (the copy that could be
+// fetched; its register map and tables are named by number).  Where the
+// sheet and the drivers read for this one disagree, the site says which
+// was taken.
+//
+// The register map (§ 7, Table 17), as this driver uses it:
+//
+//   0x0F  WHO_AM_I      0x33
+//   0x1F  TEMP_CFG_REG  ADC_PD (7), TEMP_EN (6)
+//   0x20  CTRL_REG1     ODR (7:4), LPen (3), Zen (2), Yen (1), Xen (0)
+//   0x21  CTRL_REG2     high-pass filter, left at 0 (bypassed)
+//   0x22  CTRL_REG3     I1_CLICK (7), I1_AOI1 (6), I1_AOI2 (5),
+//                       I1_DRDY1 (4), I1_DRDY2 (3), I1_WTM (2),
+//                       I1_OVERRUN (1)
+//   0x23  CTRL_REG4     BDU (7), BLE (6), FS (5:4), HR (3), ST (2:1),
+//                       SIM (0)
+//   0x24  CTRL_REG5     BOOT (7), FIFO_EN (6), LIR_INT1 (3), D4D_INT1 (2)
+//   0x25  CTRL_REG6     I2_CLICKen (7), I2_INT1 (6), BOOT_I1 (4),
+//                       H_LACTIVE (1)
+//   0x27  STATUS_REG    ZYXOR (7), ZYXDA (3)
+//   0x28  OUT_X_L to 0x2D OUT_Z_H: each axis a 16-bit two's complement
+//         count, low byte first, left-justified
+//   0x2E  FIFO_CTRL_REG FM (7:6), TR (5), FTH (4:0)
+//   0x2F  FIFO_SRC_REG  WTM (7), OVRN_FIFO (6), EMPTY (5), FSS (4:0)
+//
+// The resolution and the step.  The count is left-justified in the 16
+// bits, and how many of them are valid follows from the mode (§ 3.2.1):
+// high resolution (HR set, LPen clear) is 12 bits, normal mode (both
+// clear) 10 bits, low-power mode (LPen set) 8 bits.  The sensitivity of
+// Table 3, 1, 2, 4 and 12 mg per digit at ±2, ±4, ±8 and ±16 g, is the
+// 12-bit step; a coarser mode steps four times (10 bits) or sixteen
+// times (8 bits) as far.  The ±16 g step is 12 mg, not 16 g over 2^11.
+// Fix kept: Zephyr's lis2dh driver shifts every mode by 4 and scales by
+// the low-power figures, so a part in normal or low-power mode reads
+// wrong there; the lis3dh crate shifts by 4, 6 or 8 for the three modes,
+// as here.
+//
+// The output data rate (Table 26): ODR 0001 to 0111 are 1, 10, 25, 50,
+// 100, 200 and 400 Hz in every mode; 1000 is 1.6 kHz in low-power mode
+// only; 1001 is 1.25 kHz in normal and high-resolution mode and 5 kHz in
+// low-power mode.  Rev 1 prints those three as rounded numbers; Zephyr's
+// table, which ST's later sheets agree with, has 1620, 1344 and 5376 Hz,
+// and the driver reports those.
+//
+// The two buses.  On I2C the part answers at 0x18 (SA0 low) or 0x19 (SA0
+// high), and bit 7 of the sub-address makes the register address
+// advance after each byte (§ 6.1.1).  On SPI a transaction is a command
+// byte, then data, inside one chip-select window: bit 7 is RW (1 reads),
+// bit 6 is MS (1 advances the register address after each byte), bits 5
+// to 0 the register (§ 6.2).  The two conventions differ: the SPI
+// command carries the increment in bit 6, the I2C sub-address in bit 7,
+// and a driver that sets bit 7 on SPI sets RW.  The part drives SDO on
+// the falling edge of SPC and samples SDI on the rising edge, with SPC
+// idle high, which is SPI mode 3, up to 10 MHz (Table 6).  CS high at
+// power-up and during every I2C transaction keeps the part on I2C.
+//
+// Drivers read for their fixes, nothing ported: Zephyr's
+// `drivers/sensor/st/lis2dh` and the `lis3dh` crate 0.5.0 (tdittr).  Each
+// fix kept is named at its site.
+//
+// The driver holds no state: the range, the mode and the rate are read
+// from the part in the same transaction as the sample.
+//
+// A bus enters through `Lis3dhPort`, which a type that holds a bus
+// implements: `Lis3dh` for an I2C bus and `Lis3dhSpi` for an SPI bus.
+// The framing of each bus is the generic functions `i2c_read_into`,
+// `i2c_write`, `spi_read_into` and `spi_write`, so a test runs them over
+// a double of the bus.
+
+use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, I2cBus, SpiBus, GpioOut }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_accel.{ AccelMilliG, AccelRange, Accelerometer }
+use dev_id.{ DeviceId, Identifiable }
+
+// The registers.
+let WHO_AM_I      = 0x0F
+let TEMP_CFG_REG  = 0x1F
+let CTRL_REG1     = 0x20
+let CTRL_REG2     = 0x21
+let CTRL_REG3     = 0x22
+let CTRL_REG4     = 0x23
+let CTRL_REG5     = 0x24
+let CTRL_REG6     = 0x25
+let STATUS_REG    = 0x27
+let OUT_X_L       = 0x28
+let FIFO_CTRL_REG = 0x2E
+let FIFO_SRC_REG  = 0x2F
+
+// WHO_AM_I's value.
+let ID_LIS3DH = 0x33
+
+// The SPI command byte's RW and MS bits, and the I2C sub-address's
+// auto-increment bit.
+let SPI_READ  = 0x80
+let SPI_MULTI = 0x40
+let I2C_MULTI = 0x80
+
+// CTRL_REG1: the axis enables, and LPen.
+let CTRL1_XYZ = 0x07
+let CTRL1_LPEN = 0x08
+// CTRL_REG3: the data-ready of the first data set on INT1, and the FIFO
+// watermark on INT1.
+let CTRL3_I1_DRDY1 = 0x10
+let CTRL3_I1_WTM = 0x04
+// CTRL_REG4: block data update, so the two bytes of an axis come from one
+// sample, high-resolution output, and the self-test bits ST1 and ST0.
+let CTRL4_BDU = 0x80
+let CTRL4_HR = 0x08
+let CTRL4_ST_MASK = 0x06
+let CTRL4_FS_MASK = 0x30
+// CTRL_REG5: the FIFO enable.
+let CTRL5_FIFO_EN = 0x40
+// STATUS_REG: a new sample of all three axes.
+let STATUS_ZYXDA = 0x08
+// FIFO_CTRL_REG: stream mode (FM 10), the mode that keeps the newest
+// samples.
+let FIFO_STREAM = 0x80
+// FIFO_SRC_REG: the empty flag and the 5-bit count.
+let FIFO_EMPTY = 0x20
+let FIFO_FSS = 0x1F
+// The most samples the FIFO holds.
+let FIFO_DEPTH = 32
+
+// The ODR code of the default rate `start` sets, 100 Hz.
+let ODR_100 = 5
+
+// The clocks `setup` asks for: I2C fast mode, and SPI at 4 MHz in mode 3.
+let I2C_HZ = 400000
+let SPI_HZ = 4000000
+let SPI_MODE = 3
+
+// The most polls of the data-ready flag a self-test makes for one
+// sample: a sample takes 10 ms at 100 Hz, and a poll over I2C takes
+// about 100 us.
+let SELF_TEST_POLLS = 4000
+
+// The resolution mode of the part (§ 3.2.1).
+pub @value
+enum Lis3dhMode
+    Lis3dhHighRes
+    Lis3dhNormal
+    Lis3dhLowPower
+
+// A bus the part is on.  `setup` makes the bus and the pins ready and
+// answers whether the wiring suits the bus; `read_regs` reads `n`
+// registers from `reg` in one transaction; `write_reg` writes one
+// register; `irq_level` answers the level of the interrupt pin.
+pub trait Lis3dhPort
+    fn setup(self) -> Bool [hw]
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+    fn irq_level(self) -> Int [hw]
+
+// ── The two buses ────────────────────────────────────────────────────
+
+// The sub-address that goes out for a read of `n` registers from `reg`
+// on I2C: bit 7 set for more than one.
+fn i2c_sub_of(reg: Int, n: Int) -> Int
+    if n > 1
+        return reg | I2C_MULTI
+    reg
+
+// The command byte that goes out for a read of `n` registers from `reg`
+// on SPI: RW set, and MS set for more than one.  Without MS every byte
+// repeats the first register.
+fn spi_cmd_of(reg: Int, n: Int) -> Int
+    var cmd = SPI_READ | (reg & 0x3F)
+    if n > 1
+        cmd = cmd | SPI_MULTI
+    cmd
+
+// Reads `n` registers from `reg` into `dst` in one I2C transaction, a
+// write of the sub-address and a repeated start: whether the part
+// answered.
+pub fn i2c_read_into<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int,
+                                var dst: DevBytes) -> Bool [hw]
+    dev_bus.wiring_read_into(bus, w, i2c_sub_of(reg, n), n, var dst)
+
+// Writes `v` to the register `reg` in one I2C transaction: whether the
+// part acknowledged.
+pub fn i2c_write<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, v: Int) -> Bool [hw]
+    var src: DevBytes = Vec.new()
+    let _ = src.push((v & 0xFF) as u8)
+    dev_bus.wiring_write_from(bus, w, reg, src)
+
+// Reads `n` registers from `reg` into `dst` in one SPI transaction:
+// whether it ran, which is whether the wiring has a chip select.  An
+// absent part reads 0xFF, which the callers check for.
+pub fn spi_read_into<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: Int,
+                                            n: Int, var dst: DevBytes) -> Bool [hw]
+    var tx: DevBytes = Vec.new()
+    let _ = tx.push(spi_cmd_of(reg, n) as u8)
+    dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, n, var dst)
+
+// Writes `v` to the register `reg` in one SPI transaction, RW and MS
+// clear: whether it ran.  The part answers nothing to a write.
+pub fn spi_write<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: Int,
+                                        v: Int) -> Bool [hw]
+    var tx: DevBytes = Vec.new()
+    let _ = tx.push((reg & 0x3F) as u8)
+    let _ = tx.push((v & 0xFF) as u8)
+    var none: DevBytes = Vec.new()
+    dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, 0, var none)
+
+// Makes an I2C bus ready: the interrupt pin an input, the bus at 400
+// kHz.  Answers true; the wiring needs an address, which a read finds
+// out.
+pub fn i2c_setup<B: I2cBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> Bool [hw]
+    if let Some(irq) = w.irq
+        gpio.mode(irq, 0)
+    bus.init(I2C_HZ)
+    w.addr != None
+
+// Makes an SPI bus ready: chip select driven high first, so the pin
+// never drives low and the part stays on the bus it was reset on, then
+// an output; the interrupt pin an input; the bus at 4 MHz in mode 3.
+// Answers whether the wiring has a chip select.
+pub fn spi_setup<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> Bool [hw]
+    let Some(cs) = w.cs else return false
+    gpio.set(cs, 1)
+    gpio.mode(cs, 1)
+    if let Some(irq) = w.irq
+        gpio.mode(irq, 0)
+    bus.init(SPI_HZ, SPI_MODE)
+    true
+
+// The level of the part's INT1 line on the board, 1 or 0, or -1 for a
+// wiring with no interrupt pin.
+pub fn irq_level_of<G: GpioOut>(gpio: G, w: DeviceWiring) -> Int [hw]
+    let Some(irq) = w.irq else return -1
+    gpio.get(irq)
+
+// ── Register access ──────────────────────────────────────────────────
+
+// One register, or `None` when the part did not answer.
+pub fn reg_read<P: Lis3dhPort>(p: P, reg: Int) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not p.read_regs(reg, 1, var b)
+        return None
+    Some(b[0] as Int)
+
+// Writes `v` to the register `reg` and reads it back: whether the part
+// holds the value.  A register with a bit that clears itself or that
+// reads back differently is written with `write_reg`.
+pub fn reg_write<P: Lis3dhPort>(p: P, reg: Int, v: Int) -> Bool [hw]
+    if not p.write_reg(reg, v)
+        return false
+    reg_read(p, reg) == Some(v & 0xFF)
+
+// Sets the bits of `mask` in `reg` to the bits of `bits`, leaving the
+// others: whether the part took it.
+//
+// Fix kept: the `lis3dh` crate's `configure` writes the whole of CTRL_REG4
+// when it enables block data update, which clears the range and the
+// resolution bits it set earlier; every setting here changes its own bits
+// of the register read from the part.
+pub fn reg_update<P: Lis3dhPort>(p: P, reg: Int, mask: Int, bits: Int) -> Bool [hw]
+    let Some(old) = reg_read(p, reg) else return false
+    reg_write(p, reg, (old & (0xFF ^ mask)) | (bits & mask))
+
+// ── Identity ─────────────────────────────────────────────────────────
+
+// WHO_AM_I as a `DeviceId`, or `None` when no part answers: the byte
+// reads 0xFF on an SPI bus no part drives and 0x00 on one held low.
+pub fn id_read<P: Lis3dhPort>(p: P) -> ?DeviceId [hw]
+    let who = reg_read(p, WHO_AM_I) ?? 0xFF
+    if who == 0xFF or who == 0
+        return None
+    Some(DeviceId { who: who, rev: None })
+
+// ── Conversions ──────────────────────────────────────────────────────
+
+// The range a CTRL_REG4 byte's FS bits select.
+pub fn range_of_ctrl4(v: Int) -> AccelRange
+    match (v >> 4) & 3
+        0 => AccelRange2g
+        1 => AccelRange4g
+        2 => AccelRange8g
+        _ => AccelRange16g
+
+// The FS bits for a range.
+pub fn fs_of_range(r: AccelRange) -> Int
+    match r
+        AccelRange2g  => 0
+        AccelRange4g  => 1
+        AccelRange8g  => 2
+        AccelRange16g => 3
+
+// The mode the CTRL_REG1 and CTRL_REG4 bytes select: LPen set is
+// low-power mode, otherwise HR set is high resolution, otherwise normal
+// mode.  Both set is not a mode the sheet allows; the driver reads it as
+// low-power.
+pub fn mode_of(ctrl1: Int, ctrl4: Int) -> Lis3dhMode
+    if (ctrl1 & CTRL1_LPEN) != 0
+        return Lis3dhLowPower
+    if (ctrl4 & CTRL4_HR) != 0
+        return Lis3dhHighRes
+    Lis3dhNormal
+
+// How far the 16-bit count shifts right to its valid bits: 4, 6 or 8.
+pub fn shift_of(m: Lis3dhMode) -> Int
+    match m
+        Lis3dhHighRes  => 4
+        Lis3dhNormal   => 6
+        Lis3dhLowPower => 8
+
+// The step of one count in micro-g: Table 3's 1, 2, 4 and 12 mg for the
+// 12-bit mode, four times that for 10 bits, sixteen times for 8 bits.
+pub fn ug_per_count(r: AccelRange, m: Lis3dhMode) -> Int
+    let base = match r
+        AccelRange2g  => 1000
+        AccelRange4g  => 2000
+        AccelRange8g  => 4000
+        AccelRange16g => 12000
+    match m
+        Lis3dhHighRes  => base
+        Lis3dhNormal   => base * 4
+        Lis3dhLowPower => base * 16
+
+// The rate in hertz a CTRL_REG1 byte selects: 0 when the part is powered
+// down or the code is reserved.  Code 1001 is 1344 Hz, or 5376 Hz in
+// low-power mode.
+pub fn rate_of_ctrl1(v: Int) -> Int
+    match (v >> 4) & 15
+        1 => 1
+        2 => 10
+        3 => 25
+        4 => 50
+        5 => 100
+        6 => 200
+        7 => 400
+        8 => 1620
+        9 => rate_of_code9(v)
+        _ => 0
+
+// The rate of ODR code 1001: 5376 Hz in low-power mode, 1344 Hz in the
+// others.
+fn rate_of_code9(ctrl1: Int) -> Int
+    if (ctrl1 & CTRL1_LPEN) != 0
+        return 5376
+    1344
+
+// The ODR code of the slowest rate at or above `hz` in the mode `m`, or
+// of the fastest the mode has.  1620 Hz is low-power mode only, and
+// above it, and in the other modes above 400 Hz, the code is 1001.
+pub fn odr_for_rate(hz: Int, m: Lis3dhMode) -> Int
+    if hz <= 1
+        return 1
+    if hz <= 10
+        return 2
+    if hz <= 25
+        return 3
+    if hz <= 50
+        return 4
+    if hz <= 100
+        return 5
+    if hz <= 200
+        return 6
+    if hz <= 400
+        return 7
+    if is_low_power(m) and hz <= 1620
+        return 8
+    9
+
+// Whether `m` is low-power mode.
+fn is_low_power(m: Lis3dhMode) -> Bool
+    match m
+        Lis3dhLowPower => true
+        _              => false
+
+// The milli-g of an axis whose low byte is at `i` of `b`: the 16-bit
+// count shifted to its valid bits with its sign kept, times the step.
+fn axis(b: DevBytes, i: Int, shift: Int, ug: Int) -> Int
+    let raw = dev_bus.dev_sign_extend((b[i + 1] as Int << 8) | b[i] as Int, 16) >> shift
+    raw * ug / 1000
+
+// ── Samples ──────────────────────────────────────────────────────────
+
+// The most recent sample, in one transaction of fourteen registers from
+// CTRL_REG1 to OUT_Z_H, so the range, the mode and the rate it is
+// converted with are the ones it was taken in: CTRL_REG1 to CTRL_REG4,
+// CTRL_REG5, CTRL_REG6, REFERENCE, STATUS_REG, then the three axes.
+// `None` when the part did not answer.
+pub fn sample_read<P: Lis3dhPort>(p: P) -> ?AccelMilliG [hw]
+    var b: DevBytes = Vec.new()
+    if not p.read_regs(CTRL_REG1, 14, var b)
+        return None
+    let m = mode_of(b[0] as Int, b[3] as Int)
+    let ug = ug_per_count(range_of_ctrl4(b[3] as Int), m)
+    let s = shift_of(m)
+    Some(AccelMilliG { x: axis(b, 8, s, ug), y: axis(b, 10, s, ug), z: axis(b, 12, s, ug) })
+
+// Whether a new sample of all three axes has completed since the last
+// read: STATUS_REG's ZYXDA.
+pub fn sample_ready<P: Lis3dhPort>(p: P) -> Bool [hw]
+    ((reg_read(p, STATUS_REG) ?? 0) & STATUS_ZYXDA) != 0
+
+// The range the part is set to, ±2 g when it does not answer.
+pub fn range_read<P: Lis3dhPort>(p: P) -> AccelRange [hw]
+    range_of_ctrl4(reg_read(p, CTRL_REG4) ?? 0)
+
+// Sets the range and leaves the other bits of CTRL_REG4: whether the
+// part took it.
+pub fn range_write<P: Lis3dhPort>(p: P, r: AccelRange) -> Bool [hw]
+    reg_update(p, CTRL_REG4, CTRL4_FS_MASK, fs_of_range(r) << 4)
+
+// The rate the part samples at in hertz, 0 when it is powered down or
+// does not answer.
+pub fn rate_read<P: Lis3dhPort>(p: P) -> Int [hw]
+    rate_of_ctrl1(reg_read(p, CTRL_REG1) ?? 0)
+
+// The mode the part is in, high resolution when it does not answer.
+pub fn mode_read<P: Lis3dhPort>(p: P) -> Lis3dhMode [hw]
+    var b: DevBytes = Vec.new()
+    if not p.read_regs(CTRL_REG1, 4, var b)
+        return Lis3dhHighRes
+    mode_of(b[0] as Int, b[3] as Int)
+
+// Sets the slowest rate at or above `hz` in the part's present mode, the
+// axes on, and leaves LPen: the rate the part took in hertz, or 0 when it
+// did not take it.  The first sample at the new rate comes one period
+// later.
+pub fn rate_write<P: Lis3dhPort>(p: P, hz: Int) -> Int [hw]
+    let Some(old) = reg_read(p, CTRL_REG1) else return 0
+    let v = (odr_for_rate(hz, mode_of(old, 0)) << 4) | (old & CTRL1_LPEN) | CTRL1_XYZ
+    if not reg_write(p, CTRL_REG1, v)
+        return 0
+    rate_of_ctrl1(v)
+
+// Sets the mode: whether the part took it.  HR and LPen are never both
+// set, so the bit being left is cleared before the bit being entered is
+// set.  The rate keeps its code, except that 1.6 kHz, which only
+// low-power mode has, becomes 1.344 kHz when the mode is left; the rate
+// the part now has is `rate_read`'s.  The caller waits the settling after
+// a change of mode, between one and seven sample periods as the `lis3dh`
+// crate documents, before it trusts a sample.
+pub fn mode_write<P: Lis3dhPort>(p: P, m: Lis3dhMode) -> Bool [hw]
+    let Some(c1) = reg_read(p, CTRL_REG1) else return false
+    let Some(c4) = reg_read(p, CTRL_REG4) else return false
+    var odr = (c1 >> 4) & 15
+    var lp = 0
+    var hr = 0
+    if is_low_power(m)
+        lp = CTRL1_LPEN
+    elif m == Lis3dhHighRes
+        hr = CTRL4_HR
+    if lp == 0 and odr == 8
+        odr = 9
+    reg_write(p, CTRL_REG4, c4 & (0xFF ^ CTRL4_HR)) and reg_write(p, CTRL_REG1, (odr << 4) | lp | CTRL1_XYZ) and reg_write(p, CTRL_REG4, (c4 & (0xFF ^ CTRL4_HR)) | hr)
+
+// ── The FIFO ─────────────────────────────────────────────────────────
+//
+// The FIFO holds 32 samples of three axes (§ 5.1).  It is off after
+// `start`; `fifo_start` turns it on in stream mode, which overwrites the
+// oldest sample when it is full, and `fifo_stop` turns it off.  A sample
+// is read from it through OUT_X_L to OUT_Z_H like a live one, and has the
+// resolution and the step of the mode.
+
+// Turns the FIFO on in stream mode with the watermark at `threshold`
+// samples, 1 to 31, and puts the watermark, not the data-ready, on INT1:
+// whether the part took every setting.
+//
+// Fix kept: the `lis3dh` crate writes FIFO_CTRL_REG first and sets
+// FIFO_EN in CTRL_REG5 after it, so the FIFO starts in the mode asked for.
+pub fn fifo_start<P: Lis3dhPort>(p: P, threshold: Int) -> Bool [hw]
+    var th = threshold
+    if th < 1
+        th = 1
+    if th > 31
+        th = 31
+    reg_write(p, FIFO_CTRL_REG, FIFO_STREAM | th) and reg_update(p, CTRL_REG5, CTRL5_FIFO_EN, CTRL5_FIFO_EN) and reg_write(p, CTRL_REG3, CTRL3_I1_WTM)
+
+// Turns the FIFO off and puts the data-ready back on INT1: whether the
+// part took every setting.  Bypass mode empties the FIFO.
+//
+// Fix kept: the `lis3dh` crate clears FIFO_CTRL_REG first and FIFO_EN
+// after it.
+pub fn fifo_stop<P: Lis3dhPort>(p: P) -> Bool [hw]
+    reg_write(p, FIFO_CTRL_REG, 0) and reg_update(p, CTRL_REG5, CTRL5_FIFO_EN, 0) and reg_write(p, CTRL_REG3, CTRL3_I1_DRDY1)
+
+// The number of samples in the FIFO: 0 when it is empty or the part did
+// not answer.  FSS is five bits, so a full FIFO of 32 reads FSS 0 with
+// EMPTY clear.
+pub fn fifo_count<P: Lis3dhPort>(p: P) -> Int [hw]
+    let v = reg_read(p, FIFO_SRC_REG) ?? FIFO_EMPTY
+    if (v & FIFO_EMPTY) != 0
+        return 0
+    let n = v & FIFO_FSS
+    if n == 0
+        return FIFO_DEPTH
+    n
+
+// Moves the samples of the FIFO, oldest first, into `dst`, which is
+// emptied first, and answers how many it moved.  The count is read once,
+// the mode once, and each sample is one burst of the six output
+// registers.
+pub fn fifo_read<P: Lis3dhPort>(p: P, var dst: Vec[AccelMilliG; 32]) -> Int [hw]
+    dst.clear()
+    let n = fifo_count(p)
+    if n == 0
+        return 0
+    var ctx: DevBytes = Vec.new()
+    if not p.read_regs(CTRL_REG1, 4, var ctx)
+        return 0
+    let m = mode_of(ctx[0] as Int, ctx[3] as Int)
+    let ug = ug_per_count(range_of_ctrl4(ctx[3] as Int), m)
+    let s = shift_of(m)
+    var moved = 0
+    for _i in 0..n
+        var b: DevBytes = Vec.new()
+        if not p.read_regs(OUT_X_L, 6, var b)
+            return moved
+        let _ = dst.push(AccelMilliG { x: axis(b, 0, s, ug), y: axis(b, 2, s, ug), z: axis(b, 4, s, ug) })
+        moved = moved + 1
+    moved
+
+// ── Self-test ────────────────────────────────────────────────────────
+
+// Waits for the next sample by polling STATUS_REG's ZYXDA, at most
+// `SELF_TEST_POLLS` times: whether one came.
+fn wait_sample<P: Lis3dhPort>(p: P) -> Bool [hw]
+    for _i in 0..SELF_TEST_POLLS
+        if sample_ready(p)
+            return true
+    false
+
+// Two samples, the first discarded because the output settles over the
+// first period, and the second answered.
+fn settled_sample<P: Lis3dhPort>(p: P) -> ?AccelMilliG [hw]
+    if not wait_sample(p)
+        return None
+    let _first = sample_read(p)
+    if not wait_sample(p)
+        return None
+    sample_read(p)
+
+// The change the part's self-test makes to its outputs (§ 3.2.2): the
+// part at ±2 g in high resolution at 100 Hz is read with ST clear and
+// again with ST1 ST0 at 01 (`negative` false) or 10 (`negative` true),
+// and the answer is the second reading minus the first, in milli-g.  The
+// settings the part had are put back.  `None` when the part did not
+// answer or a sample did not come.
+//
+// Rev 1's Table 3 gives the change as typical 276 LSb on X and Y and 984
+// LSb on Z, 1 LSb being 1 mg at ±2 g, and no limits; `self_test_within`
+// checks it against limits the caller takes from the sheet of its part's
+// revision.
+pub fn self_test_delta<P: Lis3dhPort>(p: P, negative: Bool) -> ?AccelMilliG [hw]
+    let Some(c1) = reg_read(p, CTRL_REG1) else return None
+    let Some(c4) = reg_read(p, CTRL_REG4) else return None
+    let base4 = CTRL4_BDU | CTRL4_HR
+    var st = 0x02
+    if negative
+        st = 0x04
+    var ok = false
+    var dx = 0
+    var dy = 0
+    var dz = 0
+    if reg_write(p, CTRL_REG4, base4) and reg_write(p, CTRL_REG1, (ODR_100 << 4) | CTRL1_XYZ)
+        if let Some(off) = settled_sample(p)
+            if reg_write(p, CTRL_REG4, base4 | st)
+                if let Some(on) = settled_sample(p)
+                    dx = on.x - off.x
+                    dy = on.y - off.y
+                    dz = on.z - off.z
+                    ok = true
+    let _back4 = reg_write(p, CTRL_REG4, c4 & (0xFF ^ CTRL4_ST_MASK))
+    let _back1 = reg_write(p, CTRL_REG1, c1)
+    if not ok
+        return None
+    Some(AccelMilliG { x: dx, y: dy, z: dz })
+
+// Whether every axis of the self-test change `d` is at least `lo` and at
+// most `hi` in magnitude, in milli-g.
+pub fn self_test_within(d: AccelMilliG, lo: Int, hi: Int) -> Bool
+    abs_in(d.x, lo, hi) and abs_in(d.y, lo, hi) and abs_in(d.z, lo, hi)
+
+// Whether the magnitude of `v` is within `lo` to `hi`.
+fn abs_in(v: Int, lo: Int, hi: Int) -> Bool
+    var a = v
+    if a < 0
+        a = 0 - a
+    a >= lo and a <= hi
+
+// ── Bring-up ─────────────────────────────────────────────────────────
+
+// Brings the part up: the bus made ready; WHO_AM_I checked; the registers
+// put back to a known state, because the part has no reset pin and keeps
+// them across a restart of the program, as Zephyr's lis2dh driver does
+// with a burst write of zeros (power-down, high-pass filter bypassed,
+// data-ready off, FIFO bypassed and off, interrupt pins active high);
+// then block data update with high resolution at ±2 g, the data-ready on
+// INT1, and 100 Hz with the three axes on.  Answers whether the part
+// answered as a LIS3DH and took every setting.  The caller has waited the
+// 5 ms the part takes to boot after power-on, which Zephyr's driver
+// waits and ST's AN5005 gives.
+pub fn start<P: Lis3dhPort>(p: P) -> Bool [hw]
+    if not p.setup()
+        return false
+    if reg_read(p, WHO_AM_I) != Some(ID_LIS3DH)
+        return false
+    reg_write(p, CTRL_REG1, CTRL1_XYZ) and reg_write(p, CTRL_REG2, 0) and reg_write(p, CTRL_REG3, 0) and reg_write(p, CTRL_REG5, 0) and reg_write(p, CTRL_REG6, 0) and reg_write(p, FIFO_CTRL_REG, 0) and reg_write(p, TEMP_CFG_REG, 0) and reg_write(p, CTRL_REG4, CTRL4_BDU | CTRL4_HR) and reg_write(p, CTRL_REG3, CTRL3_I1_DRDY1) and reg_write(p, CTRL_REG1, (ODR_100 << 4) | CTRL1_XYZ)
+
+// ── The part on an I2C bus ───────────────────────────────────────────
+
+// A LIS3DH on a board's I2C bus at the address `w.addr`, 0x18 or 0x19,
+// with the board's GPIO for the interrupt line.
+pub @value
+struct Lis3dh
+    bus: BoardI2c
+    pins: BoardGpio
+    w: DeviceWiring
+
+impl Lis3dhPort for Lis3dh
+    fn setup(self) -> Bool [hw]
+        i2c_setup(self.bus, self.pins, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        i2c_read_into(self.bus, self.w, reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        i2c_write(self.bus, self.w, reg, v)
+
+    fn irq_level(self) -> Int [hw]
+        irq_level_of(self.pins, self.w)
+
+impl Lis3dh
+    // The part at `w.addr` on the board's I2C bus, as a board's device
+    // table builds it.  Nothing is sent.
+    fn attach(bus: BoardI2c, pins: BoardGpio, w: DeviceWiring) -> Lis3dh
+        Lis3dh { bus: bus, pins: pins, w: w }
+
+    // Brings the part up (`start`).
+    fn begin(self) -> Bool [hw]
+        start(self)
+
+    // One register's byte, `None` when the part did not answer.
+    fn reg(self, r: Int) -> ?Int [hw]
+        reg_read(self, r)
+
+    // Writes a register and reads it back.
+    fn set_reg(self, r: Int, v: Int) -> Bool [hw]
+        reg_write(self, r, v)
+
+    // The resolution mode.
+    fn mode(self) -> Lis3dhMode [hw]
+        mode_read(self)
+
+    // Sets the resolution mode (`mode_write`).
+    fn set_mode(self, m: Lis3dhMode) -> Bool [hw]
+        mode_write(self, m)
+
+    // Turns the FIFO on with the watermark at `threshold` samples.
+    fn fifo_begin(self, threshold: Int) -> Bool [hw]
+        fifo_start(self, threshold)
+
+    // Turns the FIFO off.
+    fn fifo_end(self) -> Bool [hw]
+        fifo_stop(self)
+
+    // The self-test change in milli-g (`self_test_delta`).
+    fn self_test(self, negative: Bool) -> ?AccelMilliG [hw]
+        self_test_delta(self, negative)
+
+impl Accelerometer[hw] for Lis3dh
+    fn accel_read(self) -> ?AccelMilliG [hw]
+        sample_read(self)
+
+    fn accel_ready(self) -> Bool [hw]
+        sample_ready(self)
+
+    fn accel_range(self) -> AccelRange [hw]
+        range_read(self)
+
+    fn accel_set_range(self, r: AccelRange) -> Bool [hw]
+        range_write(self, r)
+
+    fn accel_rate_hz(self) -> Int [hw]
+        rate_read(self)
+
+    fn accel_set_rate_hz(self, hz: Int) -> Int [hw]
+        rate_write(self, hz)
+
+    fn accel_fifo_count(self) -> Int [hw]
+        fifo_count(self)
+
+    fn accel_fifo_read(self, var dst: Vec[AccelMilliG; 32]) -> Int [hw]
+        fifo_read(self, var dst)
+
+impl Identifiable[hw] for Lis3dh
+    // WHO_AM_I, 0x33; the part keeps no revision register, so `rev` is
+    // `None`.
+    fn device_id(self) -> ?DeviceId [hw]
+        id_read(self)
+
+// ── The part on an SPI bus ───────────────────────────────────────────
+
+// A LIS3DH on a board's SPI bus with the chip select `w.cs`, with the
+// board's GPIO for the chip select and the interrupt line.
+pub @value
+struct Lis3dhSpi
+    bus: BoardSpi
+    pins: BoardGpio
+    w: DeviceWiring
+
+impl Lis3dhPort for Lis3dhSpi
+    fn setup(self) -> Bool [hw]
+        spi_setup(self.bus, self.pins, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        spi_read_into(self.bus, self.pins, self.w, reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        spi_write(self.bus, self.pins, self.w, reg, v)
+
+    fn irq_level(self) -> Int [hw]
+        irq_level_of(self.pins, self.w)
+
+impl Lis3dhSpi
+    // The part on the board's SPI bus with the chip select `w.cs`, as a
+    // board's device table builds it.  Nothing is sent.
+    fn attach(bus: BoardSpi, pins: BoardGpio, w: DeviceWiring) -> Lis3dhSpi
+        Lis3dhSpi { bus: bus, pins: pins, w: w }
+
+    // Brings the part up (`start`).
+    fn begin(self) -> Bool [hw]
+        start(self)
+
+    // One register's byte, `None` when the wiring has no chip select.
+    fn reg(self, r: Int) -> ?Int [hw]
+        reg_read(self, r)
+
+    // Writes a register and reads it back.
+    fn set_reg(self, r: Int, v: Int) -> Bool [hw]
+        reg_write(self, r, v)
+
+    // The resolution mode.
+    fn mode(self) -> Lis3dhMode [hw]
+        mode_read(self)
+
+    // Sets the resolution mode (`mode_write`).
+    fn set_mode(self, m: Lis3dhMode) -> Bool [hw]
+        mode_write(self, m)
+
+    // Turns the FIFO on with the watermark at `threshold` samples.
+    fn fifo_begin(self, threshold: Int) -> Bool [hw]
+        fifo_start(self, threshold)
+
+    // Turns the FIFO off.
+    fn fifo_end(self) -> Bool [hw]
+        fifo_stop(self)
+
+    // The self-test change in milli-g (`self_test_delta`).
+    fn self_test(self, negative: Bool) -> ?AccelMilliG [hw]
+        self_test_delta(self, negative)
+
+impl Accelerometer[hw] for Lis3dhSpi
+    fn accel_read(self) -> ?AccelMilliG [hw]
+        sample_read(self)
+
+    fn accel_ready(self) -> Bool [hw]
+        sample_ready(self)
+
+    fn accel_range(self) -> AccelRange [hw]
+        range_read(self)
+
+    fn accel_set_range(self, r: AccelRange) -> Bool [hw]
+        range_write(self, r)
+
+    fn accel_rate_hz(self) -> Int [hw]
+        rate_read(self)
+
+    fn accel_set_rate_hz(self, hz: Int) -> Int [hw]
+        rate_write(self, hz)
+
+    fn accel_fifo_count(self) -> Int [hw]
+        fifo_count(self)
+
+    fn accel_fifo_read(self, var dst: Vec[AccelMilliG; 32]) -> Int [hw]
+        fifo_read(self, var dst)
+
+impl Identifiable[hw] for Lis3dhSpi
+    // WHO_AM_I, 0x33; the part keeps no revision register, so `rev` is
+    // `None`.
+    fn device_id(self) -> ?DeviceId [hw]
+        id_read(self)
