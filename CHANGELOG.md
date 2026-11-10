@@ -33,4 +33,5 @@ I2C or an SPI bus.
   no limits.  A later revision should be read against both.
 - The device program builds for the nRF52840 DK and the nRF54LM20 DK, whose
   board packages answer for I2C and SPI as absent hardware: on those
-  images `begin` answers `false` until the boards drive the buses.
+  images `begin` answers `false` until the boards drive the buses.  The gap is tracked by
+  `features/embedded-devex/nordic-twim-i2c-driver.md`.
