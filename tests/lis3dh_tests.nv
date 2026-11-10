@@ -42,7 +42,11 @@ fn at(m: HashMap<Int, Int>, k: Int) -> Int
 
 // The chip with WHO_AM_I and the reset values in place.
 fn chip() -> Chip
-    let c = Chip { regs: HashMap.new(), st: HashMap.new(), ro: HashMap.new(), log: HashMap.new(), fifo: HashMap.new() }
+    let c = Chip { regs: HashMap.new(),
+        st: HashMap.new(),
+        ro: HashMap.new(),
+        log: HashMap.new(),
+        fifo: HashMap.new() }
     c.regs.insert(0x0F, 0x33)
     c.regs.insert(0x20, 0x07)
     c.st.insert(4, 1)
@@ -472,7 +476,7 @@ fn test_the_identity_is_who_am_i_on_both_buses() [io, hw]
         Some(id) =>
             test.assert_eq(id.who, 0x33)
             test.assert(id.rev == None)
-        None => test.assert(false)
+        None     => test.assert(false)
     match lis3dh.id_read(spi_dut(c))
         Some(id) => test.assert_eq(id.who, 0x33)
         None     => test.assert(false)

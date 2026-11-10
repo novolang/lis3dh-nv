@@ -101,16 +101,16 @@ let SPI_MULTI = 0x40
 let I2C_MULTI = 0x80
 
 // CTRL_REG1: the axis enables, and LPen.
-let CTRL1_XYZ = 0x07
+let CTRL1_XYZ  = 0x07
 let CTRL1_LPEN = 0x08
 // CTRL_REG3: the data-ready of the first data set on INT1, and the FIFO
 // watermark on INT1.
 let CTRL3_I1_DRDY1 = 0x10
-let CTRL3_I1_WTM = 0x04
+let CTRL3_I1_WTM   = 0x04
 // CTRL_REG4: block data update, so the two bytes of an axis come from one
 // sample, high-resolution output, and the self-test bits ST1 and ST0.
-let CTRL4_BDU = 0x80
-let CTRL4_HR = 0x08
+let CTRL4_BDU     = 0x80
+let CTRL4_HR      = 0x08
 let CTRL4_ST_MASK = 0x06
 let CTRL4_FS_MASK = 0x30
 // CTRL_REG5: the FIFO enable.
@@ -122,7 +122,7 @@ let STATUS_ZYXDA = 0x08
 let FIFO_STREAM = 0x80
 // FIFO_SRC_REG: the empty flag and the 5-bit count.
 let FIFO_EMPTY = 0x20
-let FIFO_FSS = 0x1F
+let FIFO_FSS   = 0x1F
 // The most samples the FIFO holds.
 let FIFO_DEPTH = 32
 
@@ -130,8 +130,8 @@ let FIFO_DEPTH = 32
 let ODR_100 = 5
 
 // The clocks `setup` asks for: I2C fast mode, and SPI at 4 MHz in mode 3.
-let I2C_HZ = 400000
-let SPI_HZ = 4000000
+let I2C_HZ   = 400000
+let SPI_HZ   = 4000000
 let SPI_MODE = 3
 
 // The most polls of the data-ready flag a self-test makes for one
@@ -191,8 +191,8 @@ pub fn i2c_write<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, v: Int) -> Bool [
 // Reads `n` registers from `reg` into `dst` in one SPI transaction:
 // whether it ran, which is whether the wiring has a chip select.  An
 // absent part reads 0xFF, which the callers check for.
-pub fn spi_read_into<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: Int,
-                                            n: Int, var dst: DevBytes) -> Bool [hw]
+pub fn spi_read_into<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: Int, n: Int,
+                                            var dst: DevBytes) -> Bool [hw]
     var tx: DevBytes = Vec.new()
     let _ = tx.push(spi_cmd_of(reg, n) as u8)
     dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, n, var dst)
