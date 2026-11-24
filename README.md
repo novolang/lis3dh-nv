@@ -149,7 +149,7 @@ writes the wrong way round.
 
 | Module | What is in it |
 |---|---|
-| `lis3dh` | The types `Lis3dh` (I2C) and `Lis3dhSpi` (SPI), `Lis3dhMode`, the trait `Lis3dhPort`, the bus framing, the register access, the conversions, the FIFO, the self-test and the bring-up |
+| `lis3dh` | The types `Lis3dh` (I2C) and `Lis3dhSpi` (SPI), `Lis3dhMode`, the trait `Lis3dhPort` over devices-nv's `RegPort`, the bus framing, the register access, the conversions, the FIFO, the self-test and the bring-up |
 
 ## How to choose an entry point
 
@@ -179,7 +179,7 @@ the three axes on.  It answers `false` for a part that does not answer
 0x33 and for a register that does not hold what was written.
 
 A program that holds its own bus, or a test with a double of the part,
-implements `Lis3dhPort` over its bus and calls the module's functions,
+implements devices-nv's `RegPort` (`read_regs` and `write_reg`; the register reads and read-modify-writes, `port.read_reg(reg)` and `port.update_reg_verified(reg, mask, bits)`, are its methods) and `Lis3dhPort` over its bus and calls the module's functions,
 which take the port: `lis3dh.sample_read(port)`, `lis3dh.start(port)`.
 The framing of each bus is `i2c_read_into`, `i2c_write`, `spi_read_into`
 and `spi_write`, generic over `I2cBus` and `SpiBus`.

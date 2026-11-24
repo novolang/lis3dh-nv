@@ -1,6 +1,6 @@
 [package]
 name        = "lis3dh-nv"
-version     = "0.1.1"
+version     = "0.2.0"
 description = "A driver for ST's LIS3DH three-axis accelerometer on an I2C or an SPI bus: the acceleration in milli-g, the four full scales, the three resolution modes and the output data rates, the data-ready line, the FIFO as an option, the self-test and WHO_AM_I, as devices-nv's Accelerometer and Identifiable."
 license     = "Apache-2.0"
 stability   = "experimental"
@@ -20,4 +20,4 @@ novo        = ">= 0.24.0"
 embedded-hal-nv = "^0.4.0"
 # The wiring record a board's device table hands `attach`, the register
 # helpers, and the Accelerometer and Identifiable traits.
-devices-nv      = "^0.4.0"
+devices-nv      = "^0.4.1"
